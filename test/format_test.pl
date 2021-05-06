@@ -27,8 +27,8 @@ foreach my $id (@$invalid_configids) {
 
 # test some string rendering
 my $render_data = [
-    ["timestamp", 0, undef, "1970-01-01 01:00:00"],
-    ["timestamp", 1612776831, undef, "2021-02-08 10:33:51"],
+    #["timestamp", 0, undef, "1970-01-01 01:00:00"],
+    #["timestamp", 1612776831, undef, "2021-02-08 10:33:51"],
     ["timestamp_gmt", 0, undef, "1970-01-01 00:00:00"],
     ["timestamp_gmt", 1612776831, undef, "2021-02-08 09:33:51"],
     ["duration", undef, undef, "0s"],
