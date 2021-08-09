@@ -2,7 +2,7 @@ Source: libpve-common-perl
 Section: perl
 Priority: optional
 Maintainer: Proxmox Support Team <support@proxmox.com>
-Build-Depends: debhelper (>= 10~),
+Build-Depends: debhelper (>= 12~),
                libclone-perl,
                libdevel-cycle-perl,
                libfilesys-df-perl,
@@ -29,6 +29,7 @@ Depends: libclone-perl,
          libmime-base32-perl,
          libnet-dbus-perl,
          libnet-ip-perl,
+         libnetaddr-ip-perl,
          libproxmox-acme-perl,
          libstring-shellquote-perl,
          libtimedate-perl,

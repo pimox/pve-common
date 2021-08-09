@@ -689,6 +689,18 @@ sub pve_verify_tfa_secret {
     die "unable to decode TFA secret\n";
 }
 
+
+PVE::JSONSchema::register_format('pve-task-status-type', \&verify_task_status_type);
+sub verify_task_status_type {
+    my ($value, $noerr) = @_;
+
+    return $value if $value =~ m/^(ok|error|warning|unknown)$/i;
+
+    return undef if $noerr;
+
+    die "invalid status '$value'\n";
+}
+
 sub check_format {
     my ($format, $value, $path) = @_;
 
@@ -714,13 +726,14 @@ sub check_format {
 	if $format_type ne 'none' && ref($registered) ne 'CODE';
 
     if ($format_type eq 'list') {
+	$parsed = [];
 	# Note: we allow empty lists
 	foreach my $v (split_list($value)) {
-	    $parsed = $registered->($v);
+	    push @{$parsed}, $registered->($v);
 	}
     } elsif ($format_type eq 'opt') {
 	$parsed = $registered->($value) if $value;
-   } else {
+    } else {
 	if (ref($registered) eq 'HASH') {
 	    # Note: this is the only case where a validator function could be
 	    # attached, hence it's safe to handle that in parse_property_string.

@@ -10,6 +10,7 @@ use PVE::Tools qw(run_command lock_file);
 use File::Basename;
 use IO::Socket::IP;
 use Net::IP;
+use NetAddr::IP qw(:lower);
 use POSIX qw(ECONNREFUSED);
 use Socket qw(NI_NUMERICHOST NI_NUMERICSERV);
 
@@ -592,7 +593,11 @@ sub is_ip_in_cidr {
     my $ip_obj = Net::IP->new($ip, $version);
     return undef if !$ip_obj;
 
-    return $cidr_obj->overlaps($ip_obj) == $Net::IP::IP_B_IN_A_OVERLAP;
+    my $overlap = $cidr_obj->overlaps($ip_obj);
+
+    return if !defined($overlap);
+
+    return $overlap == $Net::IP::IP_B_IN_A_OVERLAP || $overlap == $Net::IP::IP_IDENTICAL;
 }
 
 
@@ -648,6 +653,35 @@ sub lock_network {
     my ($code, @param) = @_;
     my $res = lock_file('/var/lock/pve-network.lck', 10, $code, @param);
     die $@ if $@;
+    return $res;
+}
+
+# the canonical form of the given IP, i.e. dotted quad for IPv4 and RFC 5952 for IPv6
+sub canonical_ip {
+    my ($ip) = @_;
+
+    my $ip_obj = NetAddr::IP->new($ip) or die "invalid IP string '$ip'\n";
+
+    return $ip_obj->canon();
+}
+
+# List of unique, canonical IPs in the provided list.
+# Keeps the original order, filtering later duplicates.
+sub unique_ips {
+    my ($ips) = @_;
+
+    my $res = [];
+    my $seen = {};
+
+    for my $ip (@{$ips}) {
+	$ip = canonical_ip($ip);
+
+	next if $seen->{$ip};
+
+	$seen->{$ip} = 1;
+	push @{$res}, $ip;
+    }
+
     return $res;
 }
 

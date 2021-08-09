@@ -2,30 +2,31 @@ package PVE::Tools;
 
 use strict;
 use warnings;
-use POSIX qw(EINTR EEXIST EOPNOTSUPP);
-use IO::Socket::IP;
-use Socket qw(AF_INET AF_INET6 AI_ALL AI_V4MAPPED AI_CANONNAME SOCK_DGRAM
-	      IPPROTO_TCP);
-use IO::Select;
+
+use Date::Format qw(time2str);
+use Digest::MD5;
+use Digest::SHA;
+use Encode;
+use Fcntl qw(:DEFAULT :flock);
 use File::Basename;
 use File::Path qw(make_path);
 use Filesys::Df (); # don't overwrite our df()
-use IO::Pipe;
-use IO::File;
 use IO::Dir;
+use IO::File;
 use IO::Handle;
+use IO::Pipe;
+use IO::Select;
+use IO::Socket::IP;
 use IPC::Open3;
-use Fcntl qw(:DEFAULT :flock);
-use base 'Exporter';
-use URI::Escape;
-use Encode;
-use Digest::SHA;
 use JSON;
-use Text::ParseWords;
-use String::ShellQuote;
-use Time::HiRes qw(usleep gettimeofday tv_interval alarm);
+use POSIX qw(EINTR EEXIST EOPNOTSUPP);
 use Scalar::Util 'weaken';
-use Date::Format qw(time2str);
+use Socket qw(AF_INET AF_INET6 AI_ALL AI_V4MAPPED AI_CANONNAME SOCK_DGRAM IPPROTO_TCP);
+use String::ShellQuote;
+use Text::ParseWords;
+use Time::HiRes qw(usleep gettimeofday tv_interval alarm);
+use URI::Escape;
+use base 'Exporter';
 
 use PVE::Syscall;
 
@@ -103,6 +104,11 @@ use constant {O_PATH    => 0x00200000,
 
 use constant {AT_EMPTY_PATH => 0x1000,
               AT_FDCWD => -100};
+
+# from <linux/fs.h>
+use constant {RENAME_NOREPLACE => (1 << 0),
+              RENAME_EXCHANGE  => (1 << 1),
+              RENAME_WHITEOUT  => (1 << 2)};
 
 sub run_with_timeout {
     my ($timeout, $code, @param) = @_;
@@ -1165,6 +1171,31 @@ sub upid_read_status {
     return "unable to read tail (got $br bytes)";
 }
 
+# Check if the status returned by upid_read_status is an error status.
+# If the status could not be parsed it's also treated as an error.
+sub upid_status_is_error {
+    my ($status) = @_;
+
+    return !($status eq 'OK' || $status =~ m/^WARNINGS: \d+$/);
+}
+
+# takes the parsed status and returns the type, either ok, warning, error or unknown
+sub upid_normalize_status_type {
+    my ($status) = @_;
+
+    if (!$status) {
+	return 'unknown';
+    } elsif ($status eq 'OK') {
+	return 'ok';
+    } elsif ($status =~ m/^WARNINGS: \d+$/) {
+	return 'warning';
+    } elsif ($status eq 'unexpected status') {
+	return 'unknown';
+    } else {
+	return 'error';
+    }
+}
+
 # useful functions to store comments in config files
 sub encode_text {
     my ($text) = @_;
@@ -1459,6 +1490,11 @@ sub syncfs($) {
 sub fsync($) {
     my ($fileno) = @_;
     return 0 == syscall(PVE::Syscall::fsync, $fileno);
+}
+
+sub renameat2($$$$$) {
+    my ($olddirfd, $oldpath, $newdirfd, $newpath, $flags) = @_;
+    return 0 == syscall(PVE::Syscall::renameat2, $olddirfd, $oldpath, $newdirfd, $newpath, $flags);
 }
 
 sub sync_mountpoint {
@@ -1827,6 +1863,118 @@ sub safe_compare {
     return -1 if !defined($left);
     return 1 if !defined($right);
     return $cmp->($left, $right);
+}
+
+
+# opts is a hash ref with the following known properties
+#  allow_overwrite - if 1, overwriting existing files is allowed, use with care. Default to false
+#  hash_required - if 1, at least one checksum has to be specified otherwise an error will be thrown
+#  http_proxy
+#  https_proxy
+#  verify_certificates - if 0 (false) we tell wget to ignore untrusted TLS certs. Default to true
+#  md5sum|sha(1|224|256|384|512)sum - the respective expected checksum string
+sub download_file_from_url {
+    my ($dest, $url, $opts) = @_;
+
+    my ($checksum_algorithm, $checksum_expected);
+    for ('sha512', 'sha384', 'sha256', 'sha224', 'sha1', 'md5') {
+	if (defined($opts->{"${_}sum"})) {
+	    $checksum_algorithm = $_;
+	    $checksum_expected = $opts->{"${_}sum"};
+	    last;
+	}
+    }
+    die "checksum required but not specified\n" if ($opts->{hash_required} && !$checksum_algorithm);
+
+    print "downloading $url to $dest\n";
+
+    if (-f $dest) {
+	if ($checksum_algorithm) {
+	    print "calculating checksum of existing file...";
+	    my $checksum_got = get_file_hash($checksum_algorithm, $dest);
+
+	    if (lc($checksum_got) eq lc($checksum_expected)) {
+		print "OK, got correct file already, no need to download\n";
+		return;
+	    } elsif ($opts->{allow_overwrite}) {
+		print "checksum mismatch: got '$checksum_got' != expect '$checksum_expected', re-download\n";
+	    } else {
+		print "\n";  # the front end expects the error to reside at the last line without any noise
+		die "checksum mismatch: got '$checksum_got' != expect '$checksum_expected', aborting\n";
+	    }
+	} elsif (!$opts->{allow_overwrite}) {
+	    die "refusing to override existing file '$dest'\n";
+	}
+    }
+
+    my $tmpdest = "$dest.tmp.$$";
+    eval {
+	local $SIG{INT} = sub {
+	    unlink $tmpdest or warn "could not cleanup temporary file: $!";
+	    die "got interrupted by signal\n";
+	};
+
+	{ # limit the scope of the ENV change
+	    local %ENV;
+	    if ($opts->{http_proxy}) {
+		$ENV{http_proxy} = $opts->{http_proxy};
+	    }
+	    if ($opts->{https_proxy}) {
+		$ENV{https_proxy} = $opts->{https_proxy};
+	    }
+
+	    my $cmd = ['wget', '--progress=dot:giga', '-O', $tmpdest, $url];
+
+	    if (!($opts->{verify_certificates} // 1)) { # default to true
+		push @$cmd, '--no-check-certificate';
+	    }
+
+	    run_command($cmd, errmsg => "download failed");
+	}
+
+	if ($checksum_algorithm) {
+	    print "calculating checksum...";
+
+	    my $checksum_got = get_file_hash($checksum_algorithm, $tmpdest);
+
+	    if (lc($checksum_got) eq lc($checksum_expected)) {
+		print "OK, checksum verified\n";
+	    } else {
+		print "\n";  # the front end expects the error to reside at the last line without any noise
+		die "checksum mismatch: got '$checksum_got' != expect '$checksum_expected'\n";
+	    }
+	}
+
+	rename($tmpdest, $dest) or die "unable to rename temporary file: $!\n";
+    };
+    if (my $err = $@) {
+	unlink $tmpdest or warn "could not cleanup temporary file: $!";
+	die $err;
+    }
+
+    print "download of '$url' to '$dest' finished\n";
+}
+
+sub get_file_hash {
+    my ($algorithm, $filename) = @_;
+
+    my $algorithm_map = {
+	'md5' => sub { Digest::MD5->new },
+	'sha1' => sub { Digest::SHA->new(1) },
+	'sha224' => sub { Digest::SHA->new(224) },
+	'sha256' => sub { Digest::SHA->new(256) },
+	'sha384' => sub { Digest::SHA->new(384) },
+	'sha512' => sub { Digest::SHA->new(512) },
+    };
+
+    my $digester = $algorithm_map->{$algorithm}->() or die "unknown algorithm '$algorithm'\n";
+
+    open(my $fh, '<', $filename) or die "unable to open '$filename': $!\n";
+    binmode($fh);
+
+    my $digest = $digester->addfile($fh)->hexdigest;
+
+    return lc($digest);
 }
 
 1;

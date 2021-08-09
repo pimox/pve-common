@@ -723,14 +723,15 @@ register_file('active', "/var/log/pve/tasks/active",
 	      \&write_active_workers);
 
 
-our $bond_modes = { 'balance-rr' => 0,
-		   'active-backup' => 1,
-		   'balance-xor' => 2,
-		   'broadcast' => 3,
-		   '802.3ad' => 4,
-		   'balance-tlb' => 5,
-		   'balance-alb' => 6,
-	       };
+our $bond_modes = {
+    'balance-rr' => 0,
+    'active-backup' => 1,
+    'balance-xor' => 2,
+    'broadcast' => 3,
+    '802.3ad' => 4,
+    'balance-tlb' => 5,
+    'balance-alb' => 6,
+};
 
 my $ovs_bond_modes = {
     'active-backup' => 1,
@@ -1060,12 +1061,11 @@ sub __read_etc_network_interfaces {
 	} elsif ($iface =~ m/^vmbr\d+$/) {
 	    if (!$d->{ovs_type}) {
 		$d->{type} = 'bridge';
-
-		if (!defined ($d->{bridge_fd})) {
-		    $d->{bridge_fd} = 0;
-		}
 		if (!defined ($d->{bridge_stp})) {
 		    $d->{bridge_stp} = 'off';
+		}
+		if (!defined($d->{bridge_fd}) && $d->{bridge_stp} eq 'off') {
+		    $d->{bridge_fd} = 0;
 		}
 	    } elsif ($d->{ovs_type} eq 'OVSBridge') {
 		$d->{type} = $d->{ovs_type};
@@ -1078,10 +1078,19 @@ sub __read_etc_network_interfaces {
 		$ifaces->{$1}->{exists} = 0;
 		$d->{exists} = 0;
 	    }
-	} elsif ($iface =~ m/^(\S+)\.\d+$/ || $d->{'vlan-raw-device'}) {
+	} elsif ($iface =~ m/^(\S+)\.(\d+)$/ || $d->{'vlan-raw-device'}) {
 	    $d->{type} = 'vlan';
 
-	    my $raw_iface = $d->{'vlan-raw-device'} ? $d->{'vlan-raw-device'} : $1;
+	    my ($dev, $id) = ($1, $2);
+	    $d->{'vlan-raw-device'} = $dev if defined($dev) && !$d->{'vlan-raw-device'};
+
+	    if (!$id && $iface =~ m/^vlan(\d+)$/) { # VLAN id 0 is not valid, so truthy check it is
+		$id = $1;
+	    }
+	    $d->{'vlan-id'} = $id if $id;
+
+	    my $raw_iface = $d->{'vlan-raw-device'};
+
 	    if (defined ($ifaces->{$raw_iface})) {
 		$d->{exists} = $ifaces->{$raw_iface}->{exists};
 	    } else {
@@ -1145,6 +1154,10 @@ sub __read_etc_network_interfaces {
 
 	$d->{method} = 'manual' if !$d->{method};
 	$d->{method6} = 'manual' if !$d->{method6};
+
+	if (my $comments6 = delete $d->{comments6}) {
+	    $d->{comments} = ($d->{comments} // '') . $comments6;
+	}
 
 	$d->{families} ||= ['inet'];
     }
@@ -1210,12 +1223,9 @@ sub __interface_to_string {
 
     return '' if !($d && $d->{"method$suffix"});
 
-    my $raw = '';
-
-    $raw .= "iface $iface $family " . $d->{"method$suffix"} . "\n";
+    my $raw = "iface $iface $family " . $d->{"method$suffix"} . "\n";
 
     if (my $addr = $d->{"address$suffix"}) {
-
 	if ($addr !~ /\/\d+$/ && $d->{"netmask$suffix"}) {
 	    if ($d->{"netmask$suffix"} =~ m/^\d+$/) {
 		$addr .= "/" . $d->{"netmask$suffix"};
@@ -1223,8 +1233,7 @@ sub __interface_to_string {
 		$addr .= "/" . $mask;
 	    }
 	}
-
-	$raw .= "\taddress " . $addr . "\n";
+	$raw .= "\taddress ${addr}\n";
     }
 
     $raw .= "\tgateway " . $d->{"gateway$suffix"} . "\n" if $d->{"gateway$suffix"};
@@ -1232,7 +1241,7 @@ sub __interface_to_string {
     my $done = { type => 1, priority => 1, method => 1, active => 1, exists => 1,
 		 comments => 1, autostart => 1, options => 1,
 		 address => 1, netmask => 1, gateway => 1, broadcast => 1,
-		 method6 => 1, families => 1, options6 => 1,
+		 method6 => 1, families => 1, options6 => 1, comments6 => 1,
 		 address6 => 1, netmask6 => 1, gateway6 => 1, broadcast6 => 1, 'uplink-id' => 1 };
 
     if (!$first_block) {
@@ -1244,18 +1253,29 @@ sub __interface_to_string {
 	$raw .= "\tbridge-ports $ports\n";
 	$done->{bridge_ports} = 1;
 
-	my $v = defined($d->{bridge_stp}) ? $d->{bridge_stp} : 'off';
-	$raw .= "\tbridge-stp $v\n";
+	my $br_stp = defined($d->{bridge_stp}) ? $d->{bridge_stp} : 'off';
+	my $no_stp = $br_stp eq 'off';
+
+	$raw .= "\tbridge-stp $br_stp\n";
 	$done->{bridge_stp} = 1;
 
-	$v = defined($d->{bridge_fd}) ? $d->{bridge_fd} : 0;
-	$raw .= "\tbridge-fd $v\n";
+	# NOTE: forwarding delay must be 2 <= FD <= 30 if STP is enabled
+	if (defined(my $br_fd = $d->{bridge_fd})) {
+	    if ($no_stp || ($br_fd >= 2 && $br_fd <= 30)) {
+		$raw .= "\tbridge-fd $br_fd\n";
+	    } else {
+		# only complain if the user actually set a value, but not for default fallback below
+		warn "'$iface': ignoring 'bridge_fd' value '$br_fd', outside of allowed range 2-30\n";
+	    }
+	} elsif ($no_stp) {
+	    $raw .= "\tbridge-fd 0\n";
+	}
 	$done->{bridge_fd} = 1;
 
 	if( defined($d->{bridge_vlan_aware})) {
 	    $raw .= "\tbridge-vlan-aware yes\n";
-	    $v = defined($d->{bridge_vids}) ? $d->{bridge_vids} : "2-4094";
-	    $raw .= "\tbridge-vids $v\n";
+	    my $vlans = defined($d->{bridge_vids}) ? $d->{bridge_vids} : "2-4094";
+	    $raw .= "\tbridge-vids $vlans\n";
 	}
 	$done->{bridge_vlan_aware} = 1;
 	$done->{bridge_vids} = 1;
@@ -1721,6 +1741,11 @@ NETWORKDOC
 	    } else {
 		$raw .= "auto $iface\n";
 	    }
+	}
+
+	# if 'inet6' is the only family
+	if (scalar($d->{families}->@*) == 1 && $d->{families}[0] eq 'inet6') {
+	    $d->{comments6} = delete $d->{comments};
 	}
 
 	my $i = 0; # some options should be printed only once
