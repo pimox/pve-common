@@ -9,6 +9,7 @@ use PVE::Tools qw(run_command lock_file);
 
 use File::Basename;
 use IO::Socket::IP;
+use JSON;
 use Net::IP;
 use NetAddr::IP qw(:lower);
 use POSIX qw(ECONNREFUSED);
@@ -16,7 +17,7 @@ use Socket qw(NI_NUMERICHOST NI_NUMERICSERV);
 
 # host network related utility functions
 
-our $PHYSICAL_NIC_RE = qr/(?:eth\d+|en[^:.]+|ib\d+)/;
+our $PHYSICAL_NIC_RE = qr/(?:eth\d+|en[^:.]+|ib[^:.]+)/;
 
 our $ipv4_reverse_mask = [
     '0.0.0.0',
@@ -600,6 +601,84 @@ sub is_ip_in_cidr {
     return $overlap == $Net::IP::IP_B_IN_A_OVERLAP || $overlap == $Net::IP::IP_IDENTICAL;
 }
 
+# get all currently configured addresses that have a global scope, i.e., are reachable from the
+# outside of the host and thus are neither loopback nor link-local ones
+# returns an array ref of: { addr => "IP", cidr => "IP/PREFIXLEN", family => "inet|inet6" }
+sub get_reachable_networks {
+    my $raw = '';
+    run_command([qw(ip -j addr show up scope global)], outfunc => sub { $raw .= shift });
+    my $decoded = decode_json($raw);
+
+    my $addrs = []; # filter/transform first so that we can sort correctly more easily below
+    for my $e ($decoded->@*) {
+	next if !$e->{addr_info} || grep { $_ eq 'LOOPBACK' } $e->{flags}->@*;
+	push $addrs->@*, grep { scalar(keys $_->%*) } $e->{addr_info}->@*
+    }
+    my $res = [];
+    for my $info (sort { $a->{family} cmp $b->{family} || $a->{local} cmp $b->{local} } $addrs->@*) {
+	push $res->@*, {
+	    addr => $info->{local},
+	    cidr => "$info->{local}/$info->{prefixlen}",
+	    family => $info->{family},
+	};
+    }
+
+    return $res;
+}
+
+# get one or all local IPs that are not loopback ones, able to pick up the following ones (in order)
+# - the hostname primary resolves too, follows gai.conf (admin controlled) and will be prioritised
+# - all configured in the interfaces configuration
+# - all currently networks known to the kernel in the current (root) namespace
+# returns a single address if no parameter is passed, and all found, grouped by type, if `all => 1`
+# is passed.
+sub get_local_ip {
+    my (%param) = @_;
+
+    my $nodename = PVE::INotify::nodename();
+    my $resolved_host = eval { get_ip_from_hostname($nodename) };
+
+    return $resolved_host if defined($resolved_host) && !$param{all};
+
+    my $all = { v4 => {}, v6 => {} }; # hash to avoid duplicates and group by type
+
+    my $ifaces = PVE::INotify::read_file('interfaces', 1)->{data}->{ifaces};
+    for my $if (values $ifaces->%*) {
+	next if $if->{type} eq 'loopback' || (!defined($if->{address}) && !defined($if->{address6}));
+	my ($v4, $v6) = ($if->{address}, $if->{address6});
+
+	return ($v4 // $v6) if !$param{all}; # prefer v4, admin can override $resolved_host via hosts/gai.conf
+
+	$all->{v4}->{$v4} = 1 if defined($v4);
+	$all->{v6}->{$v6} = 1 if defined($v6);
+    }
+
+    my $live = eval { get_reachable_networks() } // [];
+    for my $info ($live->@*) {
+	my $addr = $info->{addr};
+
+	return $addr if !$param{all};
+
+	if ($info->{family} eq 'inet') {
+	    $all->{v4}->{$addr} = 1;
+	} else {
+	    $all->{v6}->{$addr} = 1;
+	}
+    }
+
+    return undef if !$param{all}; # getting here means no early return above triggered -> no IPs
+
+    my $res = []; # order gai.conf controlled first, then group v4 and v6, simply lexically sorted
+    if ($resolved_host) {
+	push $res->@*, $resolved_host;
+	delete $all->{v4}->{$resolved_host};
+	delete $all->{v6}->{$resolved_host};
+    }
+    push $res->@*, sort { $a cmp $b } keys $all->{v4}->%*;
+    push $res->@*, sort { $a cmp $b } keys $all->{v6}->%*;
+
+    return $res;
+}
 
 sub get_local_ip_from_cidr {
     my ($cidr) = @_;
@@ -632,21 +711,15 @@ sub get_ip_from_hostname {
 	return undef;
     }
 
-    my ($ip, $family);
     for my $ai (@res) {
-	$family = $ai->{family};
-	my $tmpip = addr_to_ip($ai->{addr});
-	if ($tmpip !~ m/^127\.|^::1$/) {
-	    $ip = $tmpip;
-	    last;
+	my $ip = addr_to_ip($ai->{addr});
+	if ($ip !~ m/^127\.|^::1$/) {
+	    return wantarray ? ($ip, $ai->{family}) : $ip;
 	}
     }
-    if (!defined($ip) ) {
-	die "hostname lookup '$hostname' failed - got local IP address '$ip'\n" if !$noerr;
-	return undef;
-    }
-
-    return wantarray ? ($ip, $family) : $ip;
+    # NOTE: we only get here if no WAN/LAN IP was found, so this is now the error path!
+    die "address lookup for '$hostname' did not find any IP address\n" if !$noerr;
+    return undef;
 }
 
 sub lock_network {
